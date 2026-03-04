@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UD Domain Dashboard</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'IBM Plex Mono', monospace; background: #030712; color: #f9fafb; min-height: 100vh; padding: 40px; }
+  .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 48px; border-bottom: 1px solid #0f172a; padding-bottom: 24px; }
+  .title { font-size: 18px; font-weight: 700; letter-spacing: 0.05em; }
+  .subtitle { font-size: 10px; color: #4b5563; margin-top: 6px; }
+  .section { margin-bottom: 56px; }
+  .section-header { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
+  .section-title { font-size: 10px; font-weight: 600; color: #374151; letter-spacing: 0.2em; }
+  .sql-toggle { font-size: 9px; color: #1f2937; background: none; border: 1px solid #111827; border-radius: 3px; padding: 2px 8px; cursor: pointer; font-family: 'IBM Plex Mono', monospace; letter-spacing: 0.05em; transition: all 0.2s; }
+  .sql-toggle:hover { color: #4b5563; border-color: #1f2937; }
+  .sql-block { background: #050a12; border: 1px solid #0f172a; border-radius: 6px; padding: 20px; font-size: 10px; color: #1f2937; margin-bottom: 20px; overflow-x: auto; white-space: pre; display: none; line-height: 1.8; }
+  .sql-block.visible { display: block; }
+  .cards { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }
+  .card { background: #060c17; border: 1px solid #0f172a; border-radius: 6px; padding: 18px 24px; min-width: 170px; }
+  .card-label { font-size: 9px; color: #1f2937; letter-spacing: 0.2em; margin-bottom: 8px; }
+  .card-value { font-size: 24px; font-weight: 700; color: #e2e8f0; letter-spacing: -0.02em; }
+  .card-wow { font-size: 10px; margin-top: 6px; font-weight: 600; color: #10b981; }
+  .card-wow-sub { font-size: 9px; color: #1f2937; margin-top: 2px; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: #10b981; display: inline-block; margin-right: 8px; flex-shrink: 0; }
+  .chart-wrap { background: #060c17; border: 1px solid #0f172a; border-radius: 6px; padding: 28px 28px 20px; }
+  .chart-legend { display: flex; gap: 24px; margin-bottom: 20px; }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 9px; color: #374151; letter-spacing: 0.12em; }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+  canvas { display: block; width: 100%; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <div class="title">UD DOMAIN DASHBOARD</div>
+    <div class="subtitle" id="last-refresh">last updated: Tue Mar 03 2026</div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <span class="dot"></span>
+    <span class="section-title">TOTAL ACTIVE DUMs</span>
+    <button class="sql-toggle" onclick="toggleSQL('dums')">SQL</button>
+  </div>
+  <pre class="sql-block" id="sql-dums">WITH dns_active AS (
+  SELECT dl.domain_id
+  FROM public.domain_locations dl
+  WHERE dl.domain_id IN (SELECT domain_id FROM public.domain_locations WHERE registry = 'DNS')
+    AND dl.registry IN ('DNS', 'UNS')
+  GROUP BY dl.domain_id
+  HAVING MAX(dl.expires_at)::date >= CURRENT_DATE
+),
+transfer_ins AS (SELECT DISTINCT domain_id FROM public.products WHERE type = 'Web2TransferInProduct')
+SELECT COUNT(*), COUNT(*) FILTER (WHERE ti.domain_id IS NULL), COUNT(*) FILTER (WHERE ti.domain_id IS NOT NULL)
+FROM dns_active da LEFT JOIN transfer_ins ti ON ti.domain_id = da.domain_id
+-- +7d: filtered to MIN(created_at) >= CURRENT_DATE - INTERVAL '7 days'</pre>
+  <div id="cards-dums" class="cards"></div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <span class="dot"></span>
+    <span class="section-title">TOTAL ACTIVE wDUMs</span>
+    <button class="sql-toggle" onclick="toggleSQL('wdums')">SQL</button>
+  </div>
+  <pre class="sql-block" id="sql-wdums">-- Same as DUMs with TLD weighting:
+-- .com/.ai/.io/.xyz = 1.00 | .shop/.sbs/.net/.org/... = 0.75
+-- .games/.tech/.ltd/... = 0.55 | 2-letter TLDs = 0.35
+-- .pw = 0.01 | .info/.link = 0.00 | default = 0.30</pre>
+  <div id="cards-wdums" class="cards"></div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <span class="dot"></span>
+    <span class="section-title">NEW DUMs — MONTH OVER MONTH</span>
+    <button class="sql-toggle" onclick="toggleSQL('chart')">SQL</button>
+  </div>
+  <pre class="sql-block" id="sql-chart">WITH dns_active AS (
+  SELECT dl.domain_id, MIN(dl.created_at) AS first_created
+  FROM public.domain_locations dl
+  WHERE dl.domain_id IN (SELECT domain_id FROM public.domain_locations WHERE registry = 'DNS')
+    AND dl.registry IN ('DNS', 'UNS')
+  GROUP BY dl.domain_id
+  HAVING MAX(dl.expires_at)::date >= CURRENT_DATE
+),
+transfer_ins AS (SELECT DISTINCT domain_id FROM public.products WHERE type = 'Web2TransferInProduct')
+SELECT DATE_TRUNC('month', da.first_created) AS month,
+  COUNT(*) AS new_total,
+  COUNT(*) FILTER (WHERE ti.domain_id IS NOT NULL) AS new_transfers
+FROM dns_active da LEFT JOIN transfer_ins ti ON ti.domain_id = da.domain_id
+WHERE da.first_created >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '11 months'
+GROUP BY 1 ORDER BY 1</pre>
+  <div class="chart-wrap">
+    <div class="chart-legend">
+      <div class="legend-item"><div class="legend-dot" style="background:#1d4ed8"></div>TOTAL NEW</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#059669"></div>TRANSFERS IN</div>
+    </div>
+    <canvas id="mom-chart" height="200"></canvas>
+  </div>
+</div>
+
+<script>
+const DATA = {
+  dums: {
+    total: { total: 883078, direct: 592690, transfers: 290388 },
+    new7d: { total: 36691,  direct: 16688,  transfers: 20003  }
+  },
+  wdums: {
+    total: { total: 883078, weighted: 707638.84, direct: 592690, direct_w: 424332.84, transfers: 290388, transfers_w: 283306.00 },
+    new7d: { total: 36691,  weighted: 33508.96,  direct: 16688,  direct_w: 13867.90,  transfers: 20003,  transfers_w: 19641.06  }
+  },
+  mom: [
+    { month: "APR '25", total: 26620,  transfers: 13076, partial: false },
+    { month: "MAY '25", total: 32686,  transfers: 13477, partial: false },
+    { month: "JUN '25", total: 44186,  transfers: 14949, partial: false },
+    { month: "JUL '25", total: 45108,  transfers: 14307, partial: false },
+    { month: "AUG '25", total: 74879,  transfers: 12813, partial: false },
+    { month: "SEP '25", total: 141613, transfers: 15950, partial: false },
+    { month: "OCT '25", total: 68443,  transfers: 24936, partial: false },
+    { month: "NOV '25", total: 121535, transfers: 64037, partial: false },
+    { month: "DEC '25", total: 67540,  transfers: 28617, partial: false },
+    { month: "JAN '26", total: 107663, transfers: 23258, partial: false },
+    { month: "FEB '26", total: 111187, transfers: 40142, partial: false },
+    { month: "MAR '26", total: 4497,   transfers: 2951,  partial: true  }
+  ]
+};
+
+function fmt(n) { return Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 }); }
+
+function card(label, total, added) {
+  const pct = total > 0 ? ((added / total) * 100).toFixed(2) : 0;
+  return `<div class="card">
+    <div class="card-label">${label}</div>
+    <div class="card-value">${fmt(total)}</div>
+    <div class="card-wow">▲ ${fmt(added)} this week</div>
+    <div class="card-wow-sub">${pct}% of total</div>
+  </div>`;
+}
+
+function toggleSQL(key) {
+  document.getElementById('sql-' + key).classList.toggle('visible');
+}
+
+function renderDums() {
+  const t = DATA.dums.total, n = DATA.dums.new7d;
+  document.getElementById('cards-dums').innerHTML =
+    card('TOTAL ACTIVE', t.total, n.total) +
+    card('DIRECT PURCHASES', t.direct, n.direct) +
+    card('TRANSFERS IN', t.transfers, n.transfers);
+}
+
+function renderWdums() {
+  const t = DATA.wdums.total, n = DATA.wdums.new7d;
+  document.getElementById('cards-wdums').innerHTML =
+    card('TOTAL ACTIVE', t.total, n.total) +
+    card('WEIGHTED TOTAL', t.weighted, n.weighted) +
+    card('DIRECT PURCHASES', t.direct, n.direct) +
+    card('DIRECT WEIGHTED', t.direct_w, n.direct_w) +
+    card('TRANSFERS IN', t.transfers, n.transfers) +
+    card('TRANSFERS WEIGHTED', t.transfers_w, n.transfers_w);
+}
+
+function renderChart() {
+  const canvas = document.getElementById('mom-chart');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.parentElement.clientWidth - 56;
+  const H = 220;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.scale(dpr, dpr);
+
+  const d = DATA.mom;
+  const pad = { top: 16, right: 16, bottom: 36, left: 68 };
+  const cw = W - pad.left - pad.right;
+  const ch = H - pad.top - pad.bottom;
+  const maxVal = Math.max(...d.map(r => r.total));
+  const barW = Math.floor(cw / d.length * 0.6);
+  const gap = cw / d.length;
+
+  function xPos(i) { return pad.left + i * gap + gap / 2; }
+  function yPos(v) { return pad.top + ch - (v / maxVal) * ch; }
+  function yH(v) { return (v / maxVal) * ch; }
+
+  ctx.strokeStyle = '#0f172a';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.top + (ch / 4) * i;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+    const val = Math.round(maxVal * (1 - i / 4));
+    ctx.fillStyle = '#1f2937';
+    ctx.font = '9px IBM Plex Mono';
+    ctx.textAlign = 'right';
+    ctx.fillText(val >= 1000 ? (val/1000).toFixed(0) + 'k' : val, pad.left - 8, y + 3);
+  }
+
+  d.forEach((row, i) => {
+    const x = xPos(i) - barW / 2;
+    ctx.globalAlpha = row.partial ? 0.35 : 1;
+    ctx.fillStyle = '#1d4ed8';
+    ctx.fillRect(x, yPos(row.total), barW, yH(row.total));
+    ctx.fillStyle = '#059669';
+    ctx.fillRect(x, yPos(row.transfers), barW, yH(row.transfers));
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = row.partial ? '#1f2937' : '#374151';
+    ctx.font = '9px IBM Plex Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText(row.month + (row.partial ? '*' : ''), xPos(i), H - 10);
+  });
+
+  ctx.fillStyle = '#1f2937';
+  ctx.font = '9px IBM Plex Mono';
+  ctx.textAlign = 'left';
+  ctx.fillText('* partial month', pad.left, H - 2);
+}
+
+renderDums();
+renderWdums();
+renderChart();
+window.addEventListener('resize', renderChart);
+</script>
+</body>
+</html>
