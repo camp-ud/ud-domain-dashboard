@@ -1,1 +1,451 @@
+const express = require("express");
+const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
+const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
+const { z } = require("zod");
 
+// --- SECURE CONFIGURATION ---
+const NOTION_TOKEN = process.env.NOTION_TOKEN;
+const CRM_DB = process.env.CRM_DB;
+const CONTACTS_DB = process.env.CONTACTS_DB;
+const MY_SECRET_PASSWORD = process.env.MY_SECRET_PASSWORD;
+const NOTION_VERSION = "2022-06-28";
+
+// ─── Notion API Client ────────────────────────────────────────────────────────
+
+async function notionRequest(path, method = "GET", body) {
+  const res = await fetch(`https://api.notion.com/v1${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${NOTION_TOKEN}`,
+      "Notion-Version": NOTION_VERSION,
+      "Content-Type": "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Notion API error ${res.status}: ${err}`);
+  }
+  return res.json();
+}
+
+async function queryAllPages(dbId, filter, sorts) {
+  const results = [];
+  let cursor;
+  let hasMore = true;
+  while (hasMore) {
+    const body = { page_size: 100 };
+    if (filter) body.filter = filter;
+    if (sorts) body.sorts = sorts;
+    if (cursor) body.start_cursor = cursor;
+    const data = await notionRequest(`/databases/${dbId}/query`, "POST", body);
+    results.push(...data.results);
+    hasMore = data.has_more;
+    cursor = data.next_cursor ?? undefined;
+  }
+  return results;
+}
+
+// ─── Property Helpers ─────────────────────────────────────────────────────────
+
+function getProp(page, name) {
+  const prop = page.properties[name];
+  if (!prop) return "";
+  switch (prop.type) {
+    case "title":           return prop.title?.map(t => t.plain_text).join("") ?? "";
+    case "rich_text":       return prop.rich_text?.map(t => t.plain_text).join("") ?? "";
+    case "select":          return prop.select?.name ?? "";
+    case "multi_select":    return prop.multi_select?.map(s => s.name).join(", ") ?? "";
+    case "email":           return prop.email ?? "";
+    case "url":             return prop.url ?? "";
+    case "phone_number":    return prop.phone_number ?? "";
+    case "checkbox":        return prop.checkbox ? "Yes" : "No";
+    case "date":            return prop.date?.start ?? "";
+    case "number":          return prop.number?.toString() ?? "";
+    case "created_time":    return prop.created_time?.slice(0, 10) ?? "";
+    case "last_edited_time":return prop.last_edited_time?.slice(0, 10) ?? "";
+    default:                return "";
+  }
+}
+
+function formatCRMRecord(page) {
+  return {
+    id: page.id,
+    company: getProp(page, "Company"),
+    stage: getProp(page, "Stage"),
+    tier: getProp(page, "Tier"),
+    owner: getProp(page, "Owner"),
+    lead_type: getProp(page, "Lead Type"),
+    primary_contact: getProp(page, "Primary Contact"),
+    primary_contact_email: getProp(page, "Primary Contact Email"),
+    next_steps: getProp(page, "Next Steps"),
+    notes: getProp(page, "Notes"),
+    reach_out_date: getProp(page, "Reach Out Date"),
+    website: getProp(page, "Website"),
+    url: page.url,
+  };
+}
+
+function formatContactRecord(page) {
+  return {
+    id: page.id,
+    name: getProp(page, "Name"),
+    email: getProp(page, "Email"),
+    title_role: getProp(page, "Title / Role"),
+    outreach_stage: getProp(page, "Outreach Stage"),
+    linkedin: getProp(page, "LinkedIn"),
+    x_handle: getProp(page, "X Handle"),
+    notes: getProp(page, "Notes"),
+    last_contacted: getProp(page, "Last Contacted"),
+    url: page.url,
+  };
+}
+
+// ─── Zod → JSON Schema converter (supports the subset of Zod used here) ──────
+
+function zodToJsonSchema(zodSchema) {
+  const def = zodSchema._def;
+
+  if (!def) return {};
+
+  switch (def.typeName) {
+    case "ZodObject": {
+      const shape = def.shape();
+      const properties = {};
+      const required = [];
+      for (const [key, field] of Object.entries(shape)) {
+        const fieldDef = field._def;
+        const isOptional = fieldDef.typeName === "ZodOptional";
+        const inner = isOptional ? fieldDef.innerType : field;
+        properties[key] = zodToJsonSchema(inner);
+        if (fieldDef.description) properties[key].description = fieldDef.description;
+        if (!isOptional) required.push(key);
+      }
+      const result = { type: "object", properties };
+      if (required.length) result.required = required;
+      return result;
+    }
+    case "ZodString":   return { type: "string" };
+    case "ZodNumber":   return { type: "number" };
+    case "ZodBoolean":  return { type: "boolean" };
+    case "ZodArray":    return { type: "array", items: zodToJsonSchema(def.type) };
+    case "ZodEnum":     return { type: "string", enum: def.values };
+    case "ZodOptional": return zodToJsonSchema(def.innerType);
+    case "ZodNullable": return { ...zodToJsonSchema(def.innerType), nullable: true };
+    default:            return {};
+  }
+}
+
+// ─── Tool Registry ────────────────────────────────────────────────────────────
+// Central map: toolName → { name, description, schema (Zod), handler }
+
+const TOOLS = {};
+
+function defineTool(name, description, schema, handler) {
+  TOOLS[name] = { name, description, schema, handler };
+}
+
+// ─── Tool Definitions ─────────────────────────────────────────────────────────
+
+// 1. Query CRM records
+defineTool(
+  "crm_query",
+  "Query the Reseller CRM database with optional filters. Returns all matching records.",
+  z.object({
+    stage:         z.string().optional().describe("Filter by deal stage (e.g. 'Active', 'Closed Won')"),
+    tier:          z.string().optional().describe("Filter by partner tier (e.g. 'Gold', 'Silver')"),
+    owner:         z.string().optional().describe("Filter by deal owner name"),
+    company:       z.string().optional().describe("Filter by company name (partial match)"),
+    exclude_closed:z.boolean().optional().describe("When true, excludes Closed Won and Closed Lost records"),
+  }),
+  async (params) => {
+    const conditions = [];
+    if (params.stage)   conditions.push({ property: "Stage",   select: { equals: params.stage } });
+    if (params.tier)    conditions.push({ property: "Tier",    select: { equals: params.tier } });
+    if (params.owner)   conditions.push({ property: "Owner",   select: { equals: params.owner } });
+    if (params.company) conditions.push({ property: "Company", title:  { contains: params.company } });
+    if (params.exclude_closed) {
+      conditions.push({ property: "Stage", select: { does_not_equal: "Closed Won" } });
+      conditions.push({ property: "Stage", select: { does_not_equal: "Closed Lost" } });
+    }
+    const filter = conditions.length === 0 ? undefined
+      : conditions.length === 1 ? conditions[0]
+      : { and: conditions };
+    const pages = await queryAllPages(CRM_DB, filter);
+    const records = pages.map(formatCRMRecord);
+    return { content: [{ type: "text", text: `Found ${records.length} records\n\n${JSON.stringify(records, null, 2)}` }] };
+  }
+);
+
+// 2. Get a single CRM record by Notion page ID
+defineTool(
+  "crm_get",
+  "Retrieve a single CRM record by its Notion page ID.",
+  z.object({
+    id: z.string().describe("The Notion page ID of the CRM record"),
+  }),
+  async (params) => {
+    const page = await notionRequest(`/pages/${params.id}`);
+    const record = formatCRMRecord(page);
+    return { content: [{ type: "text", text: JSON.stringify(record, null, 2) }] };
+  }
+);
+
+// 3. Create a new CRM record
+defineTool(
+  "crm_create",
+  "Create a new record in the Reseller CRM database.",
+  z.object({
+    company:               z.string().describe("Company name (required)"),
+    stage:                 z.string().optional().describe("Deal stage"),
+    tier:                  z.string().optional().describe("Partner tier"),
+    owner:                 z.string().optional().describe("Deal owner"),
+    lead_type:             z.string().optional().describe("Lead type"),
+    primary_contact:       z.string().optional().describe("Primary contact name"),
+    primary_contact_email: z.string().optional().describe("Primary contact email address"),
+    website:               z.string().optional().describe("Company website URL"),
+    next_steps:            z.string().optional().describe("Planned next steps"),
+    notes:                 z.string().optional().describe("Additional notes"),
+  }),
+  async (params) => {
+    const properties = {
+      Company: { title: [{ text: { content: params.company } }] },
+    };
+    if (params.stage)   properties.Stage   = { select: { name: params.stage } };
+    if (params.tier)    properties.Tier    = { select: { name: params.tier } };
+    if (params.owner)   properties.Owner   = { select: { name: params.owner } };
+    if (params.lead_type) properties["Lead Type"] = { select: { name: params.lead_type } };
+    if (params.primary_contact) properties["Primary Contact"] = { rich_text: [{ text: { content: params.primary_contact } }] };
+    if (params.primary_contact_email) properties["Primary Contact Email"] = { email: params.primary_contact_email };
+    if (params.website) properties.Website = { url: params.website };
+    if (params.next_steps) properties["Next Steps"] = { rich_text: [{ text: { content: params.next_steps } }] };
+    if (params.notes)   properties.Notes   = { rich_text: [{ text: { content: params.notes } }] };
+    const page = await notionRequest("/pages", "POST", { parent: { database_id: CRM_DB }, properties });
+    const record = formatCRMRecord(page);
+    return { content: [{ type: "text", text: `Created CRM record\n\n${JSON.stringify(record, null, 2)}` }] };
+  }
+);
+
+// 4. Update the stage of a CRM record
+defineTool(
+  "crm_update_stage",
+  "Update the deal stage of an existing CRM record.",
+  z.object({
+    id:    z.string().describe("The Notion page ID of the CRM record"),
+    stage: z.string().describe("New stage value (e.g. 'Active', 'Closed Won', 'Closed Lost')"),
+  }),
+  async (params) => {
+    await notionRequest(`/pages/${params.id}`, "PATCH", {
+      properties: { Stage: { select: { name: params.stage } } },
+    });
+    return { content: [{ type: "text", text: `Updated stage to "${params.stage}" for record ${params.id}` }] };
+  }
+);
+
+// 5. Update the owner of a CRM record
+defineTool(
+  "crm_update_owner",
+  "Reassign the owner of an existing CRM record.",
+  z.object({
+    id:    z.string().describe("The Notion page ID of the CRM record"),
+    owner: z.string().describe("Name of the new owner"),
+  }),
+  async (params) => {
+    await notionRequest(`/pages/${params.id}`, "PATCH", {
+      properties: { Owner: { select: { name: params.owner } } },
+    });
+    return { content: [{ type: "text", text: `Updated owner to "${params.owner}" for record ${params.id}` }] };
+  }
+);
+
+// 6. Update notes and next steps on a CRM record
+defineTool(
+  "crm_update_notes",
+  "Update the notes and/or next steps on an existing CRM record.",
+  z.object({
+    id:         z.string().describe("The Notion page ID of the CRM record"),
+    notes:      z.string().optional().describe("New notes content (replaces existing)"),
+    next_steps: z.string().optional().describe("New next-steps content (replaces existing)"),
+  }),
+  async (params) => {
+    const properties = {};
+    if (params.notes !== undefined)      properties.Notes      = { rich_text: [{ text: { content: params.notes } }] };
+    if (params.next_steps !== undefined) properties["Next Steps"] = { rich_text: [{ text: { content: params.next_steps } }] };
+    await notionRequest(`/pages/${params.id}`, "PATCH", { properties });
+    return { content: [{ type: "text", text: `Updated notes/next_steps for record ${params.id}` }] };
+  }
+);
+
+// 7. Query contacts
+defineTool(
+  "contacts_query",
+  "Query the Contacts database with optional filters. Returns all matching contact records.",
+  z.object({
+    name:           z.string().optional().describe("Filter by contact name (partial match)"),
+    outreach_stage: z.string().optional().describe("Filter by outreach stage"),
+    email:          z.string().optional().describe("Filter by email address (partial match)"),
+  }),
+  async (params) => {
+    const conditions = [];
+    if (params.name)           conditions.push({ property: "Name",           title:     { contains: params.name } });
+    if (params.outreach_stage) conditions.push({ property: "Outreach Stage", select:    { equals: params.outreach_stage } });
+    if (params.email)          conditions.push({ property: "Email",          rich_text: { contains: params.email } });
+    const filter = conditions.length === 0 ? undefined
+      : conditions.length === 1 ? conditions[0]
+      : { and: conditions };
+    const pages = await queryAllPages(CONTACTS_DB, filter);
+    const records = pages.map(formatContactRecord);
+    return { content: [{ type: "text", text: `Found ${records.length} contacts\n\n${JSON.stringify(records, null, 2)}` }] };
+  }
+);
+
+// 8. Get a single contact by ID
+defineTool(
+  "contacts_get",
+  "Retrieve a single contact record by its Notion page ID.",
+  z.object({
+    id: z.string().describe("The Notion page ID of the contact"),
+  }),
+  async (params) => {
+    const page = await notionRequest(`/pages/${params.id}`);
+    const record = formatContactRecord(page);
+    return { content: [{ type: "text", text: JSON.stringify(record, null, 2) }] };
+  }
+);
+
+// 9. Create a new contact
+defineTool(
+  "contacts_create",
+  "Create a new contact record in the Contacts database.",
+  z.object({
+    name:           z.string().describe("Contact full name (required)"),
+    email:          z.string().optional().describe("Email address"),
+    title_role:     z.string().optional().describe("Job title or role"),
+    outreach_stage: z.string().optional().describe("Outreach stage"),
+    linkedin:       z.string().optional().describe("LinkedIn profile URL"),
+    x_handle:       z.string().optional().describe("X (Twitter) handle"),
+    notes:          z.string().optional().describe("Additional notes"),
+  }),
+  async (params) => {
+    const properties = {
+      Name: { title: [{ text: { content: params.name } }] },
+    };
+    if (params.email)          properties.Email          = { email: params.email };
+    if (params.title_role)     properties["Title / Role"]= { rich_text: [{ text: { content: params.title_role } }] };
+    if (params.outreach_stage) properties["Outreach Stage"] = { select: { name: params.outreach_stage } };
+    if (params.linkedin)       properties.LinkedIn       = { url: params.linkedin };
+    if (params.x_handle)       properties["X Handle"]   = { rich_text: [{ text: { content: params.x_handle } }] };
+    if (params.notes)          properties.Notes          = { rich_text: [{ text: { content: params.notes } }] };
+    const page = await notionRequest("/pages", "POST", { parent: { database_id: CONTACTS_DB }, properties });
+    const record = formatContactRecord(page);
+    return { content: [{ type: "text", text: `Created contact\n\n${JSON.stringify(record, null, 2)}` }] };
+  }
+);
+
+// 10. Update outreach stage of a contact
+defineTool(
+  "contacts_update_outreach",
+  "Update the outreach stage of an existing contact record.",
+  z.object({
+    id:             z.string().describe("The Notion page ID of the contact"),
+    outreach_stage: z.string().describe("New outreach stage value"),
+  }),
+  async (params) => {
+    await notionRequest(`/pages/${params.id}`, "PATCH", {
+      properties: { "Outreach Stage": { select: { name: params.outreach_stage } } },
+    });
+    return { content: [{ type: "text", text: `Updated outreach stage to "${params.outreach_stage}" for contact ${params.id}` }] };
+  }
+);
+
+// 11. Update notes on a contact
+defineTool(
+  "contacts_update_notes",
+  "Update the notes field on an existing contact record.",
+  z.object({
+    id:    z.string().describe("The Notion page ID of the contact"),
+    notes: z.string().describe("New notes content (replaces existing)"),
+  }),
+  async (params) => {
+    await notionRequest(`/pages/${params.id}`, "PATCH", {
+      properties: { Notes: { rich_text: [{ text: { content: params.notes } }] } },
+    });
+    return { content: [{ type: "text", text: `Updated notes for contact ${params.id}` }] };
+  }
+);
+
+// ─── Register all tools with the MCP server ───────────────────────────────────
+
+const server = new McpServer({ name: "notion-crm-mcp-server", version: "1.0.0" });
+
+for (const { name, description, schema, handler } of Object.values(TOOLS)) {
+  server.registerTool(name, { description, inputSchema: schema }, handler);
+}
+
+// ─── HTTP Server ──────────────────────────────────────────────────────────────
+
+const app = express();
+app.use(express.json());
+
+// Security middleware for the internal tools REST API
+function requireSecret(req, res, next) {
+  if (req.headers["x-mcp-secret"] !== MY_SECRET_PASSWORD) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+// Health check
+app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+// ── GET /api/mcp/internal/v1/tools ───────────────────────────────────────────
+// Discovery: returns name, description, and JSON Schema inputSchema for every tool
+app.get("/api/mcp/internal/v1/tools", requireSecret, (_req, res) => {
+  const tools = Object.values(TOOLS).map(({ name, description, schema }) => ({
+    name,
+    description,
+    inputSchema: zodToJsonSchema(schema),
+  }));
+  res.json({ tools });
+});
+
+// ── POST /api/mcp/internal/v1/tools/:toolName ────────────────────────────────
+// Execution: validates input against Zod schema, then invokes the tool handler
+app.post("/api/mcp/internal/v1/tools/:toolName", requireSecret, async (req, res) => {
+  const { toolName } = req.params;
+  const tool = TOOLS[toolName];
+
+  if (!tool) {
+    return res.status(404).json({ error: `Tool "${toolName}" not found` });
+  }
+
+  const parsed = tool.schema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid input", details: parsed.error.flatten() });
+  }
+
+  try {
+    const result = await tool.handler(parsed.data);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /mcp — original MCP protocol endpoint ───────────────────────────────
+app.post("/mcp", async (req, res) => {
+  if (req.headers["x-mcp-secret"] !== MY_SECRET_PASSWORD) {
+    console.error("Unauthorized MCP access attempt");
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
+  });
+  res.on("close", () => transport.close());
+  await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
+});
+
+const PORT = parseInt(process.env.PORT || "3000");
+app.listen(PORT, () => console.log(`Notion CRM MCP server running on port ${PORT}`));
